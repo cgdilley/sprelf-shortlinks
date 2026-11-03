@@ -29,7 +29,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Create a shortened link.")
     parser.add_argument("link", help="The link to shorten.")
-    parser.add_argument("--custom", help="A custom string to set as the link", default=None)
+    parser.add_argument("--custom", "-c", help="A custom string to set as the link", default=None)
     parser.add_argument("--profile", help="The AWS profile to use", default=None)
     parser.add_argument("--domain", help="The domain to use for the link", default=None)
     parser.add_argument("--table", help="The table to register the link with.", default=None)
