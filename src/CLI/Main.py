@@ -22,24 +22,28 @@ SETTINGS = HOME / ".sprelf" / "links" / "settings.yaml"
 
 def main():
     args = sys.argv[1:]
-    if not os.path.exists(SETTINGS):
-        raise FileNotFoundError(f"Settings file not found at {SETTINGS}")
-    with open(SETTINGS, "r") as f:
-        settings = Y.load(f)
-
-    profile_name = settings.get("aws_profile")
-    table_name = settings.get("table_name")
-
-    if not profile_name or not table_name:
-        raise ValueError("Missing required settings: aws_profile and table_name")
-
-    db = boto3.Session(profile_name=profile_name).client('dynamodb')
+    settings = {}
+    if os.path.exists(SETTINGS):
+        with open(SETTINGS, "r") as f:
+            settings = Y.load(f)
 
     parser = argparse.ArgumentParser(description="Create a shortened link.")
     parser.add_argument("link", help="The link to shorten.")
     parser.add_argument("--custom", help="A custom string to set as the link", default=None)
+    parser.add_argument("--profile", help="The AWS profile to use", default=None)
+    parser.add_argument("--domain", help="The domain to use for the link", default=None)
+    parser.add_argument("--table", help="The table to register the link with.", default=None)
 
     options = parser.parse_args(args)
+
+    profile_name = options.profile or settings.get("aws_profile")
+    table_name = options.table or settings.get("table_name")
+    domain_name = options.domain or settings.get("domain")
+
+    if not profile_name or not table_name or not domain_name:
+        raise ValueError("Missing required settings: aws_profile, table_name, domain")
+
+    db = boto3.Session(profile_name=profile_name).client('dynamodb')
 
     short = options.custom if options.custom \
         else ''.join(random.choices(string.ascii_letters + string.digits, k=4))
@@ -61,6 +65,6 @@ def main():
                 }
             }
         )
-        print(f"l.sprelf.com/{short}")
+        print(f"{domain_name}/{short}")
     except botocore.client.ClientError as e:
         print(f"Error: {e}")
