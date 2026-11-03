@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFront distribution that redirects short-link paths using a Lambda origin backed by a DynamoDB table.
+
+Parameters:
+  CertificateArn:
+    Type: String
+    Description: ARN of an ACM certificate in us-east-1 covering the domain name.
+  DomainName:
+    Type: String
+    Description: Custom domain name (alias) for the distribution, e.g. link.example.com.
+  AltDomainName:
+    Type: String
+    Description: Custom domain name (alias) for the distribution, e.g. link.example.com.
+  TableName:
+    Type: String
+    Default: SprelfShortLinks
+    Description: Name of the DynamoDB table with string attributes Key (partition key) and Link.
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: ID of the Route53 hosted zone that contains DomainName.
+  LambdaName:
+    Type: String
+    Default: sprelf-shortlinks
+    Description: Name of the Lambda function.
+
+Resources:
+  LinksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Key
+          KeyType: HASH
+
+  RedirectFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadLinksTable
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt LinksTable.Arn
+
+  RedirectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaName
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt RedirectFunctionRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LinksTable
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+          def handler(event, context):
+              key = event.get("rawPath", "/").lstrip("/")
+              if not key:
+                  print("No key provided.")
+                  return {"statusCode": 404, "headers": {"Content-Type": "text/plain"}, "body": "Not found"}
+              print(f"Key: {key}")
+              item = table.get_item(Key={"Key": key}).get("Item")
+              if not item or "Link" not in item:
+                  print(f"Key '{key}' not found in database.")
+                  return {"statusCode": 404, "headers": {"Content-Type": "text/plain"}, "body": "Not found"}
+              link = item["Link"].strip()
+              print(f"Raw link: {link}")
+              if "://" not in link:
+                  link = "https://" + link.lstrip("/")
+              print(f"Final link: {link}")
+              return {"statusCode": 301, "headers": {"Location": link}, "body": ""}
+
+  RedirectFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref RedirectFunction
+      AuthType: AWS_IAM
+
+  RedirectFunctionOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-redirect-oac"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  RedirectFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref RedirectFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+      FunctionUrlAuthType: AWS_IAM
+
+  RedirectFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RedirectFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Aliases:
+          - !Ref DomainName
+          - !Ref AltDomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: LambdaOrigin
+            DomainName: !Select [2, !Split ["/", !GetAtt RedirectFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt RedirectFunctionOriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: LambdaOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+  DomainRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  DomainRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  AltDomainRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AltDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  AltDomainRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AltDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  DistributionDomainName:
+    Description: CloudFront domain name; point the DNS CNAME/alias for DomainName here.
+    Value: !GetAtt Distribution.DomainName
+  FunctionUrl:
+    Description: Direct Lambda Function URL (origin).
+    Value: !GetAtt RedirectFunctionUrl.FunctionUrl
